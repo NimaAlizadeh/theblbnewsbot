@@ -68,14 +68,64 @@ def clean(text):
     return re.sub(r"\s+", " ", html.unescape(text)).strip()
 
 
-def translate(text):
+_PERSIAN = re.compile(r"[؀-ۿ]")
+
+
+def _tr_gtx(text):
+    """اندپوینت مستقیم گوگل (بدون کلید)."""
+    r = requests.get(
+        "https://translate.googleapis.com/translate_a/single",
+        params={"client": "gtx", "sl": "en", "tl": "fa", "dt": "t", "q": text},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    return "".join(part[0] for part in r.json()[0] if part and part[0])
+
+
+def _tr_deep(text):
+    return translator.translate(text)
+
+
+def _tr_mymemory(text):
+    """MyMemory: رایگان، سقف روزانه دارد، ورودی تا ۵۰۰ کاراکتر."""
+    r = requests.get(
+        "https://api.mymemory.translated.net/get",
+        params={"q": text[:500], "langpair": "en|fa"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    out = r.json()["responseData"]["translatedText"]
+    if "MYMEMORY WARNING" in out.upper():
+        raise RuntimeError(out)
+    return out
+
+
+BACKENDS = [("google-gtx", _tr_gtx), ("deep-translator", _tr_deep), ("mymemory", _tr_mymemory)]
+
+
+def translate_ex(text):
+    """برمی‌گردونه: (متن ترجمه‌شده یا اصلی, اسم موتور موفق یا None, لیست خطاها)."""
     if not text:
-        return ""
-    try:
-        return translator.translate(text[:4500]) or text
-    except Exception as e:  # اگه ترجمه نشد، متن انگلیسی رو بفرست
-        print(f"[translate error] {e}", file=sys.stderr)
-        return text
+        return "", "empty", []
+    errors = []
+    for name, fn in BACKENDS:
+        try:
+            out = (fn(text[:4500]) or "").strip()
+            if out and _PERSIAN.search(out):
+                return out, name, errors
+            errors.append(f"{name}: خروجی فارسی نبود")
+        except Exception as e:
+            errors.append(f"{name}: {type(e).__name__}: {str(e)[:200]}")
+    return text, None, errors  # هیچ‌کدوم کار نکرد: متن انگلیسی
+
+
+def translate(text):
+    out, backend, errors = translate_ex(text)
+    if backend is None:
+        for err in errors:
+            print(f"[translate error] {err}", file=sys.stderr)
+    return out
 
 
 def send_telegram(text):
@@ -174,21 +224,30 @@ def run_test():
     if not TOKEN or not CHAT_ID:
         print("خطا: TELEGRAM_TOKEN یا TELEGRAM_CHAT_ID تنظیم نشده (Secrets رو چک کن).", file=sys.stderr)
         sys.exit(1)
+    sample = "This is a test message from your news watcher bot"
+    _, backend, errors = translate_ex(sample)
+    print(f"موتور ترجمه‌ی موفق: {backend}")
+    for err in errors:
+        print(f"  [خطای ترجمه] {err}", file=sys.stderr)
     text = format_message(
         "Test",
-        "This is a test message from your news watcher bot",
+        sample,
         "If you can read this in Persian, translation and Telegram delivery both work.",
         "https://www.bbc.com/news",
     )
+    if backend is None:
+        text = "⚠️ ترجمه کار نکرد (جزئیات تو لاگ GitHub Actions)\n\n" + text
     r = requests.post(
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
         json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
         timeout=20,
     )
-    if r.ok:
-        print("پیام آزمایشی ارسال شد. تلگرامت رو چک کن.")
-    else:
+    if not r.ok:
         print(f"[telegram error] {r.status_code} {r.text}", file=sys.stderr)
+        sys.exit(1)
+    print("پیام آزمایشی ارسال شد. تلگرامت رو چک کن.")
+    if backend is None:
+        print("هشدار: همه‌ی موتورهای ترجمه شکست خوردن (بالا رو ببین).", file=sys.stderr)
         sys.exit(1)
 
 
