@@ -10,8 +10,14 @@ News watcher: چک کردن فیدهای خبری انگلیسی، ترجمه ب
 متغیرهای محیطی:
   TELEGRAM_TOKEN   توکن ربات (از @BotFather)
   TELEGRAM_CHAT_ID آیدی چت خودت
-  KEYWORDS         اختیاری، مثلا "iran,oil,election" (خالی = همه‌ی خبرها)
+  KEYWORDS         اختیاری، کلیدواژه‌های شخصی خودت، مثلا "bitcoin,election".
+                   خبری که شامل این‌ها باشه همیشه «🔴 خیلی مهم» حساب می‌شه.
+  ONLY_IMPORTANT   پیش‌فرض روشن: فقط خبرهایی که به یکی از دسته‌های مهم می‌خورن میان.
+                   برای دریافت همه‌ی خبرها (با برچسب «⚪ عادی») مقدارش رو 0 بذار.
   INTERVAL         اختیاری، فاصله‌ی چک بر حسب ثانیه (پیش‌فرض 60)
+
+تست دسته‌بندی بدون شبکه:
+  python news_watcher.py --classify "Iran sanctions tighten as oil jumps"
 """
 import argparse
 import html
@@ -45,6 +51,7 @@ SUMMARY_CHARS = 300
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 KEYWORDS = [k.strip().lower() for k in os.environ.get("KEYWORDS", "").split(",") if k.strip()]
+ONLY_IMPORTANT = os.environ.get("ONLY_IMPORTANT", "").strip().lower() not in ("0", "false", "no", "off")
 
 translator = GoogleTranslator(source="en", target="fa")
 _http_cache = {}  # etag / modified برای هر فید (فقط در حالت حلقه کار می‌کنه)
@@ -161,20 +168,103 @@ def fetch(name, url):
     return feed.entries or []
 
 
-def matches(title, summary):
-    if not KEYWORDS:
-        return True
-    blob = f"{title} {summary}".lower()
-    return any(k in blob for k in KEYWORDS)
+# ---------------------------------------------------------------------------
+# دسته‌بندی اهمیت خبر (کاملا آفلاین و رایگان، بر پایه‌ی کلیدواژه)
+#
+# هر دسته: (نام, سطح, [کلیدواژه‌ها])
+#   سطح 3 = 🔴 خیلی مهم | 2 = 🟠 مهم | 1 = 🟡 قابل توجه
+# کلیدواژه‌ای که با ^ شروع بشه حساس به حروف بزرگ/کوچکه (مثل ^Fed).
+# اگه خبر به ۲ دسته یا بیشتر بخوره، یک سطح بالاتر می‌ره
+# (مثلا «Iran» + «sanctions» = خیلی مهم).
+# برای ویرایش، فقط کلمه‌ها رو تو این لیست اضافه یا حذف کن.
+# ---------------------------------------------------------------------------
+LEVELS = {3: "🔴 خیلی مهم", 2: "🟠 مهم", 1: "🟡 قابل توجه", 0: "⚪ عادی"}
+
+CATEGORIES = [
+    ("🇮🇷 هسته‌ای ایران", 3, [
+        "JCPOA", "IAEA", "snapback", "enrichment", "uranium",
+        "nuclear deal", "nuclear talks", "nuclear program", "nuclear sites",
+    ]),
+    ("⚔️ تنش ایران و خلیج فارس", 3, [
+        "Hormuz", "Persian Gulf", "IRGC", "Revolutionary Guard",
+        "Iran-Israel", "Israel-Iran", "Israel and Iran", "Iran and Israel",
+        "US-Iran", "Iran-US", "Iran and the US", "Iran and the United States",
+    ]),
+    ("💱 اقتصاد و ارز ایران", 3, [
+        "rial", "Iran's economy", "Iranian economy", "Iran economy",
+        "Iranian currency", "Central Bank of Iran", "Tehran Stock", "Iran inflation",
+    ]),
+    ("🚫 تحریم", 2, ["sanction", "sanctions", "embargo"]),
+    ("🛢 نفت و انرژی", 2, [
+        "oil price", "oil prices", "crude", "Brent", "OPEC", "oil output",
+        "oil supply", "oil exports", "oil tanker", "Iranian oil", "Iran oil",
+        "natural gas price",
+    ]),
+    ("🏦 فدرال رزرو و اقتصاد آمریکا", 2, [
+        "^Fed", "Federal Reserve", "Fed chair", "interest rate", "interest rates",
+        "rate cut", "rate hike", "US inflation", "inflation data", "inflation report",
+        "consumer prices", "^CPI", "jobs report", "nonfarm", "Treasury yield",
+        "Treasury yields", "US dollar", "dollar index", "greenback",
+    ]),
+    ("🥇 طلا و پناهگاه امن", 2, [
+        "gold price", "gold prices", "gold rally", "gold surges", "gold hits",
+        "gold futures", "gold reserves", "bullion", "safe haven", "safe-haven",
+    ]),
+    ("💥 تنش نظامی (عمومی)", 2, [
+        "missile", "missiles", "airstrike", "airstrikes", "air strike",
+        "drone attack", "ceasefire", "Houthi", "Houthis", "Red Sea",
+    ]),
+    ("📍 خبر مربوط به ایران", 1, ["Iran", "Iranian", "Iranians", "Tehran"]),
+    ("🌍 اقتصاد جهانی و تجارت", 1, [
+        "recession", "tariff", "tariffs", "trade war", "banking crisis",
+        "debt default", "market selloff", "stock market crash",
+    ]),
+]
 
 
-def format_message(source, title, summary, link):
+def _compile(kw):
+    if kw.startswith("^"):
+        return kw[1:], re.compile(r"\b" + re.escape(kw[1:]) + r"\b")
+    return kw, re.compile(r"\b" + re.escape(kw) + r"\b", re.IGNORECASE)
+
+
+_COMPILED = [(name, level, [_compile(k) for k in kws]) for name, level, kws in CATEGORIES]
+_USER_COMPILED = [_compile(k) for k in KEYWORDS]
+
+
+def classify(title, summary=""):
+    """برمی‌گردونه: (سطح 0..3, [نام دسته‌ها], [کلیدواژه‌های پیداشده])."""
+    blob = f"{title} {summary}".replace("’", "'").replace("‘", "'")
+    cats, found, level = [], [], 0
+    for name, lvl, kws in _COMPILED:
+        hits = [label for label, rx in kws if rx.search(blob)]
+        if hits:
+            cats.append(name)
+            found += hits
+            level = max(level, lvl)
+    user_hits = [label for label, rx in _USER_COMPILED if rx.search(blob)]
+    if user_hits:
+        cats.append("🔎 کلیدواژه‌ی شما")
+        found += user_hits
+        level = 3
+    elif len(cats) >= 2:
+        level = min(3, level + 1)
+    uniq = list(dict.fromkeys(found))
+    return level, cats, uniq
+
+
+def format_message(source, title, summary, link, level=0, cats=None, kws=None):
     fa_title = translate(title)
     fa_summary = translate(summary) if summary else ""
-    parts = [f"🔴 <b>{html.escape(fa_title)}</b>"]
+    parts = [LEVELS.get(level, LEVELS[0])]
+    if cats:
+        parts[0] += "\n🏷 دسته: " + " | ".join(cats)
+    parts.append(f"<b>{html.escape(fa_title)}</b>")
     if fa_summary:
         parts.append(html.escape(fa_summary))
     parts.append(f"<i>{html.escape(title)}</i>")
+    if kws:
+        parts.append("🔑 " + html.escape(", ".join(kws[:5])))
     parts.append(f"📰 {html.escape(source)} — <a href=\"{html.escape(link)}\">لینک خبر</a>")
     return "\n\n".join(parts)
 
@@ -205,10 +295,13 @@ def check_once(send_initial=False):
 
             title = clean(e.get("title", ""))
             summary = clean(e.get("summary", ""))[:SUMMARY_CHARS]
-            if not title or not matches(title, summary):
+            if not title:
+                continue
+            level, cats, kws = classify(title, summary)
+            if ONLY_IMPORTANT and level == 0:
                 continue
 
-            send_telegram(format_message(name, title, summary, e.get("link", "")))
+            send_telegram(format_message(name, title, summary, e.get("link", ""), level, cats, kws))
             new_count += 1
             time.sleep(1)  # محدودیت نرخ تلگرام
 
@@ -224,16 +317,18 @@ def run_test():
     if not TOKEN or not CHAT_ID:
         print("خطا: TELEGRAM_TOKEN یا TELEGRAM_CHAT_ID تنظیم نشده (Secrets رو چک کن).", file=sys.stderr)
         sys.exit(1)
-    sample = "This is a test message from your news watcher bot"
+    sample = "Iran sanctions tighten as oil prices and gold jump after Fed signals rate cut"
     _, backend, errors = translate_ex(sample)
     print(f"موتور ترجمه‌ی موفق: {backend}")
     for err in errors:
         print(f"  [خطای ترجمه] {err}", file=sys.stderr)
+    level, cats, kws = classify(sample)
     text = format_message(
-        "Test",
+        "Test (نمونه‌ی آزمایشی، خبر واقعی نیست)",
         sample,
         "If you can read this in Persian, translation and Telegram delivery both work.",
         "https://www.bbc.com/news",
+        level, cats, kws,
     )
     if backend is None:
         text = "⚠️ ترجمه کار نکرد (جزئیات تو لاگ GitHub Actions)\n\n" + text
@@ -254,9 +349,15 @@ def run_test():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--test", action="store_true", help="فقط یک پیام آزمایشی به تلگرام بفرست")
+    ap.add_argument("--classify", metavar="TEXT", help="فقط دسته‌بندی یک تیتر رو چاپ کن (بدون شبکه)")
     ap.add_argument("--once", action="store_true", help="یک بار چک کن و خارج شو")
     ap.add_argument("--send-initial", action="store_true", help="در اولین اجرا هم خبرهای فعلی رو بفرست")
     args = ap.parse_args()
+
+    if args.classify:
+        level, cats, kws = classify(args.classify)
+        print(f"{LEVELS[level]} | دسته‌ها: {cats} | کلیدواژه‌ها: {kws}")
+        return
 
     if args.test:
         run_test()
