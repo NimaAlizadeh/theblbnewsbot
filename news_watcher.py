@@ -11,9 +11,9 @@ News watcher: چک کردن فیدهای خبری انگلیسی، ترجمه ب
   TELEGRAM_TOKEN   توکن ربات (از @BotFather)
   TELEGRAM_CHAT_ID آیدی چت خودت
   KEYWORDS         اختیاری، کلیدواژه‌های شخصی خودت، مثلا "bitcoin,election".
-                   خبری که شامل این‌ها باشه همیشه «🔴 خیلی مهم» حساب می‌شه.
-  ONLY_IMPORTANT   پیش‌فرض روشن: فقط خبرهایی که به یکی از دسته‌های مهم می‌خورن میان.
-                   برای دریافت همه‌ی خبرها (با برچسب «⚪ عادی») مقدارش رو 0 بذار.
+                   خبری که شامل این‌ها باشه ۷ امتیاز اهمیت اضافه می‌گیره.
+  ONLY_IMPORTANT   اختیاری، پیش‌فرض خاموش (همه‌ی خبرها میان، خبرهای بی‌ربط با برچسب
+                   «⚪ غیر مهم» و بدون صدا). اگه 1 بذاری، خبرهای «غیر مهم» ارسال نمی‌شن.
   INTERVAL         اختیاری، فاصله‌ی چک بر حسب ثانیه (پیش‌فرض 60)
 
 تست دسته‌بندی بدون شبکه:
@@ -51,7 +51,7 @@ SUMMARY_CHARS = 300
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 KEYWORDS = [k.strip().lower() for k in os.environ.get("KEYWORDS", "").split(",") if k.strip()]
-ONLY_IMPORTANT = os.environ.get("ONLY_IMPORTANT", "").strip().lower() not in ("0", "false", "no", "off")
+ONLY_IMPORTANT = os.environ.get("ONLY_IMPORTANT", "").strip().lower() in ("1", "true", "yes", "on")
 
 translator = GoogleTranslator(source="en", target="fa")
 _http_cache = {}  # etag / modified برای هر فید (فقط در حالت حلقه کار می‌کنه)
@@ -135,7 +135,7 @@ def translate(text):
     return out
 
 
-def send_telegram(text):
+def send_telegram(text, silent=False):
     if not TOKEN or not CHAT_ID:
         print("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID تنظیم نشده؛ فقط چاپ می‌کنم:\n" + text + "\n")
         return
@@ -146,6 +146,7 @@ def send_telegram(text):
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": False,
+            "disable_notification": silent,  # خبر «غیر مهم»: بی‌صدا میاد
         },
         timeout=20,
     )
@@ -169,57 +170,60 @@ def fetch(name, url):
 
 
 # ---------------------------------------------------------------------------
-# دسته‌بندی اهمیت خبر (کاملا آفلاین و رایگان، بر پایه‌ی کلیدواژه)
+# امتیازدهی اهمیت خبر (کاملا آفلاین و رایگان، بر پایه‌ی کلیدواژه)
 #
-# هر دسته: (نام, سطح, [کلیدواژه‌ها])
-#   سطح 3 = 🔴 خیلی مهم | 2 = 🟠 مهم | 1 = 🟡 قابل توجه
+# هیچ خبری حذف نمی‌شه. هر خبر یه امتیاز 0 تا 10 می‌گیره:
+#   امتیاز همه‌ی دسته‌هایی که خبر بهشون می‌خوره با هم جمع می‌شه (سقف 10).
+#   امتیاز >= 7 → 🔴 خیلی مهم | >= 4 → 🟠 مهم | >= 2 → 🟡 نسبتاً مهم | کمتر → ⚪ غیر مهم
+# هر خبری که اسم ایران توش باشه حداقل 🟠 مهم می‌شه (امتیاز پایه‌ی 4).
 # کلیدواژه‌ای که با ^ شروع بشه حساس به حروف بزرگ/کوچکه (مثل ^Fed).
-# اگه خبر به ۲ دسته یا بیشتر بخوره، یک سطح بالاتر می‌ره
-# (مثلا «Iran» + «sanctions» = خیلی مهم).
-# برای ویرایش، فقط کلمه‌ها رو تو این لیست اضافه یا حذف کن.
+# برای ویرایش، فقط کلمه‌ها یا امتیازها رو تو این لیست عوض کن.
 # ---------------------------------------------------------------------------
-LEVELS = {3: "🔴 خیلی مهم", 2: "🟠 مهم", 1: "🟡 قابل توجه", 0: "⚪ عادی"}
+LEVELS = {3: "🔴 خیلی مهم", 2: "🟠 مهم", 1: "🟡 نسبتاً مهم", 0: "⚪ غیر مهم"}
 
+# هر دسته: (نام, امتیاز, [کلیدواژه‌ها])
 CATEGORIES = [
-    ("🇮🇷 هسته‌ای ایران", 3, [
+    ("🇮🇷 هسته‌ای ایران", 7, [
         "JCPOA", "IAEA", "snapback", "enrichment", "uranium",
         "nuclear deal", "nuclear talks", "nuclear program", "nuclear sites",
     ]),
-    ("⚔️ تنش ایران و خلیج فارس", 3, [
+    ("⚔️ تنش ایران و خلیج فارس", 7, [
         "Hormuz", "Persian Gulf", "IRGC", "Revolutionary Guard",
         "Iran-Israel", "Israel-Iran", "Israel and Iran", "Iran and Israel",
         "US-Iran", "Iran-US", "Iran and the US", "Iran and the United States",
     ]),
-    ("💱 اقتصاد و ارز ایران", 3, [
+    ("💱 اقتصاد و ارز ایران", 7, [
         "rial", "Iran's economy", "Iranian economy", "Iran economy",
         "Iranian currency", "Central Bank of Iran", "Tehran Stock", "Iran inflation",
     ]),
-    ("🚫 تحریم", 2, ["sanction", "sanctions", "embargo"]),
-    ("🛢 نفت و انرژی", 2, [
+    ("📍 خبر مربوط به ایران", 4, ["Iran", "Iranian", "Iranians", "Tehran"]),
+    ("🚫 تحریم", 3, ["sanction", "sanctions", "embargo"]),
+    ("🛢 نفت و انرژی", 3, [
         "oil price", "oil prices", "crude", "Brent", "OPEC", "oil output",
         "oil supply", "oil exports", "oil tanker", "Iranian oil", "Iran oil",
         "natural gas price",
     ]),
-    ("🏦 فدرال رزرو و اقتصاد آمریکا", 2, [
+    ("🏦 فدرال رزرو و اقتصاد آمریکا", 3, [
         "^Fed", "Federal Reserve", "Fed chair", "interest rate", "interest rates",
         "rate cut", "rate hike", "US inflation", "inflation data", "inflation report",
         "consumer prices", "^CPI", "jobs report", "nonfarm", "Treasury yield",
         "Treasury yields", "US dollar", "dollar index", "greenback",
     ]),
-    ("🥇 طلا و پناهگاه امن", 2, [
+    ("🥇 طلا و پناهگاه امن", 3, [
         "gold price", "gold prices", "gold rally", "gold surges", "gold hits",
         "gold futures", "gold reserves", "bullion", "safe haven", "safe-haven",
     ]),
-    ("💥 تنش نظامی (عمومی)", 2, [
+    ("💥 تنش نظامی (عمومی)", 3, [
         "missile", "missiles", "airstrike", "airstrikes", "air strike",
         "drone attack", "ceasefire", "Houthi", "Houthis", "Red Sea",
     ]),
-    ("📍 خبر مربوط به ایران", 1, ["Iran", "Iranian", "Iranians", "Tehran"]),
-    ("🌍 اقتصاد جهانی و تجارت", 1, [
+    ("🌍 اقتصاد جهانی و تجارت", 2, [
         "recession", "tariff", "tariffs", "trade war", "banking crisis",
         "debt default", "market selloff", "stock market crash",
     ]),
 ]
+
+USER_KEYWORD_POINTS = 7  # کلیدواژه‌های شخصی خودت (متغیر KEYWORDS)
 
 
 def _compile(kw):
@@ -228,38 +232,46 @@ def _compile(kw):
     return kw, re.compile(r"\b" + re.escape(kw) + r"\b", re.IGNORECASE)
 
 
-_COMPILED = [(name, level, [_compile(k) for k in kws]) for name, level, kws in CATEGORIES]
+_COMPILED = [(name, pts, [_compile(k) for k in kws]) for name, pts, kws in CATEGORIES]
 _USER_COMPILED = [_compile(k) for k in KEYWORDS]
 
 
+def level_from_score(score):
+    if score >= 7:
+        return 3
+    if score >= 4:
+        return 2
+    if score >= 2:
+        return 1
+    return 0
+
+
 def classify(title, summary=""):
-    """برمی‌گردونه: (سطح 0..3, [نام دسته‌ها], [کلیدواژه‌های پیداشده])."""
+    """برمی‌گردونه: (امتیاز 0..10, سطح 0..3, [نام دسته‌ها], [کلیدواژه‌های پیداشده])."""
     blob = f"{title} {summary}".replace("’", "'").replace("‘", "'")
-    cats, found, level = [], [], 0
-    for name, lvl, kws in _COMPILED:
+    cats, found, score = [], [], 0
+    for name, pts, kws in _COMPILED:
         hits = [label for label, rx in kws if rx.search(blob)]
         if hits:
             cats.append(name)
             found += hits
-            level = max(level, lvl)
+            score += pts
     user_hits = [label for label, rx in _USER_COMPILED if rx.search(blob)]
     if user_hits:
         cats.append("🔎 کلیدواژه‌ی شما")
         found += user_hits
-        level = 3
-    elif len(cats) >= 2:
-        level = min(3, level + 1)
-    uniq = list(dict.fromkeys(found))
-    return level, cats, uniq
+        score += USER_KEYWORD_POINTS
+    score = min(10, score)
+    return score, level_from_score(score), cats, list(dict.fromkeys(found))
 
 
-def format_message(source, title, summary, link, level=0, cats=None, kws=None):
+def format_message(source, title, summary, link, score=0, level=0, cats=None, kws=None):
     fa_title = translate(title)
     fa_summary = translate(summary) if summary else ""
-    parts = [LEVELS.get(level, LEVELS[0])]
+    header = f"{LEVELS.get(level, LEVELS[0])}  •  امتیاز اهمیت: {score}/10"
     if cats:
-        parts[0] += "\n🏷 دسته: " + " | ".join(cats)
-    parts.append(f"<b>{html.escape(fa_title)}</b>")
+        header += "\n🏷 دسته: " + " | ".join(cats)
+    parts = [header, f"<b>{html.escape(fa_title)}</b>"]
     if fa_summary:
         parts.append(html.escape(fa_summary))
     parts.append(f"<i>{html.escape(title)}</i>")
@@ -297,11 +309,12 @@ def check_once(send_initial=False):
             summary = clean(e.get("summary", ""))[:SUMMARY_CHARS]
             if not title:
                 continue
-            level, cats, kws = classify(title, summary)
+            score, level, cats, kws = classify(title, summary)
             if ONLY_IMPORTANT and level == 0:
                 continue
 
-            send_telegram(format_message(name, title, summary, e.get("link", ""), level, cats, kws))
+            msg = format_message(name, title, summary, e.get("link", ""), score, level, cats, kws)
+            send_telegram(msg, silent=(level == 0))
             new_count += 1
             time.sleep(1)  # محدودیت نرخ تلگرام
 
@@ -322,13 +335,13 @@ def run_test():
     print(f"موتور ترجمه‌ی موفق: {backend}")
     for err in errors:
         print(f"  [خطای ترجمه] {err}", file=sys.stderr)
-    level, cats, kws = classify(sample)
+    score, level, cats, kws = classify(sample)
     text = format_message(
         "Test (نمونه‌ی آزمایشی، خبر واقعی نیست)",
         sample,
         "If you can read this in Persian, translation and Telegram delivery both work.",
         "https://www.bbc.com/news",
-        level, cats, kws,
+        score, level, cats, kws,
     )
     if backend is None:
         text = "⚠️ ترجمه کار نکرد (جزئیات تو لاگ GitHub Actions)\n\n" + text
@@ -355,8 +368,8 @@ def main():
     args = ap.parse_args()
 
     if args.classify:
-        level, cats, kws = classify(args.classify)
-        print(f"{LEVELS[level]} | دسته‌ها: {cats} | کلیدواژه‌ها: {kws}")
+        score, level, cats, kws = classify(args.classify)
+        print(f"{LEVELS[level]} (امتیاز {score}/10) | دسته‌ها: {cats} | کلیدواژه‌ها: {kws}")
         return
 
     if args.test:
