@@ -169,11 +169,39 @@ def check_once(send_initial=False):
         print(f"{new_count} خبر جدید ارسال شد.")
 
 
+def run_test():
+    """یک پیام آزمایشی (با ترجمه) می‌فرسته تا از درستی توکن و آیدی چت مطمئن بشی."""
+    if not TOKEN or not CHAT_ID:
+        print("خطا: TELEGRAM_TOKEN یا TELEGRAM_CHAT_ID تنظیم نشده (Secrets رو چک کن).", file=sys.stderr)
+        sys.exit(1)
+    text = format_message(
+        "Test",
+        "This is a test message from your news watcher bot",
+        "If you can read this in Persian, translation and Telegram delivery both work.",
+        "https://www.bbc.com/news",
+    )
+    r = requests.post(
+        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+        json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
+        timeout=20,
+    )
+    if r.ok:
+        print("پیام آزمایشی ارسال شد. تلگرامت رو چک کن.")
+    else:
+        print(f"[telegram error] {r.status_code} {r.text}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--test", action="store_true", help="فقط یک پیام آزمایشی به تلگرام بفرست")
     ap.add_argument("--once", action="store_true", help="یک بار چک کن و خارج شو")
     ap.add_argument("--send-initial", action="store_true", help="در اولین اجرا هم خبرهای فعلی رو بفرست")
     args = ap.parse_args()
+
+    if args.test:
+        run_test()
+        return
 
     if args.once:
         check_once(args.send_initial)
